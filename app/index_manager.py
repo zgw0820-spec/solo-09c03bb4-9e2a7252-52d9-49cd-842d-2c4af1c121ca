@@ -131,6 +131,7 @@ def _get_job(conn):
     row = conn.execute(
         """
         SELECT id, status, builder, error, created_at, updated_at,
+               backend_pid, backend_start,
                EXTRACT(EPOCH FROM (now() - created_at))::float AS age_s
         FROM index_build_jobs
         WHERE index_name = %s
@@ -141,7 +142,9 @@ def _get_job(conn):
         return None
     return {
         "id": row[0], "status": row[1], "builder": row[2], "error": row[3],
-        "created_at": row[4], "updated_at": row[5], "age_s": float(row[6]),
+        "created_at": row[4], "updated_at": row[5],
+        "backend_pid": row[6], "backend_start": row[7],
+        "age_s": float(row[8]),
     }
 
 
@@ -199,6 +202,34 @@ def _run_build(job_id: uuid.UUID) -> None:
     error = None
     try:
         with connect(autocommit=True) as conn:
+            # Register THIS backend on the ledger row before running the DDL.
+            # backend_start is recorded together with pid: after a backend
+            # exits its pid can be reused, so diagnostics must verify both.
+            # Read backend_start from pg_stat_activity (the
+            # pg_stat_get_backend_start() function returns NULL for non-super
+            # users). The fenced UPDATE also proves this job generation still
+            # owns the row; if it was replaced (0 rows), do not run the DDL.
+            ident = conn.execute(
+                """
+                SELECT pid, backend_start
+                FROM pg_stat_activity
+                WHERE pid = pg_backend_pid()
+                """
+            ).fetchone()
+            n = conn.execute(
+                """
+                UPDATE index_build_jobs
+                SET backend_pid = %s, backend_start = %s, updated_at = now()
+                WHERE id = %s AND status = 'building'
+                """,
+                (ident[0], ident[1], job_id),
+            ).rowcount
+            if n == 0:
+                log.info(
+                    "job %s: row replaced before DDL start; skipping build",
+                    job_id,
+                )
+                return
             conn.execute(CREATE_INDEX_SQL)
     except Exception as exc:  # e.g. canceled, deadlock, connection lost
         error = f"CREATE INDEX CONCURRENTLY failed: {exc}"

@@ -1,6 +1,7 @@
 """FastAPI surface: fault-log writes/queries + online index build operations."""
 
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -9,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import index_manager as im
+from . import diagnostics, index_manager as im
 from .db import connect, wait_for_schema
 
 logging.basicConfig(
@@ -144,3 +145,22 @@ def index_status():
 def index_cleanup():
     """Drop invalid leftover indexes (only when no build is active)."""
     return im.cleanup()
+
+
+@app.get(
+    "/indexes/jobs/{task_id}/diagnostics",
+    tags=["index"],
+    summary="Live blocking diagnostics for one index-build task",
+)
+def job_diagnostics(task_id: uuid.UUID):
+    """Associate the ledger task with the PostgreSQL backend running its DDL.
+
+    Returns the current build phase (from
+    ``pg_stat_progress_create_index``) and, only when the database confirms
+    it via ``pg_blocking_pids()``, the pids of sessions blocking the build.
+    Blockers are never guessed: a wait without a confirmed blocker is
+    reported as ``waiting_unconfirmed``. Every answer is computed live, so a
+    replaced job generation, an exited backend or a reused pid never inherit
+    a previous phase or blocker.
+    """
+    return diagnostics.diagnose_job(task_id)
